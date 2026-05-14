@@ -1,4 +1,3 @@
-# .github/workflows/codeql.yml
 name: "CodeQL Security Analysis – Zabbix"
 
 on:
@@ -7,13 +6,12 @@ on:
   pull_request:
     branches: [ "master" ]
   schedule:
-    # Weekly full scan – Saturday 08:43 UTC
     - cron: '43 8 * * 6'
 
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
-    runs-on: ${{ (matrix.language == 'swift' && 'macos-latest') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
 
     permissions:
       security-events: write
@@ -26,67 +24,52 @@ jobs:
       matrix:
         include:
 
-          # ── C/C++ ──────────────────────────────────────────────────────────
-          # Zabbix server/agent core: buffer overflows, use-after-free,
-          # out-of-bounds reads, memory leaks, format-string bugs, AT-cmd injection
+          # C/C++ — server/agent core: buffer overflows, use-after-free,
+          # OOB reads, AT-cmd injection, format-string bugs
           - language: c-cpp
-            build-mode: autobuild
-            query-suite: security-and-quality   # broader than default
+            build-mode: manual
 
-          # ── Go ────────────────────────────────────────────────────────────
-          # Zabbix Agent 2 (zbx_smart_disk_get shell injection, icmpping() RCE)
+          # Go — Agent 2: shell injection in smart.disk.get, icmpping() RCE
           - language: go
             build-mode: autobuild
-            query-suite: security-and-quality
 
-          # ── Java/Kotlin ────────────────────────────────────────────────────
+          # Java/Kotlin
           - language: java-kotlin
             build-mode: none
-            query-suite: security-and-quality
 
-          # ── JavaScript/TypeScript ──────────────────────────────────────────
-          # Duktape JS engine bindings, frontend JS, session-cookie handling
+          # JavaScript/TypeScript — Duktape JS engine bindings, frontend,
+          # session-cookie handling, HttpRequest header injection
           - language: javascript-typescript
             build-mode: none
-            query-suite: security-and-quality
 
     steps:
-      # ── 1. Checkout ────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # full history helps taint-tracking across files
+          fetch-depth: 0  # full history improves inter-file taint tracking
 
-      # ── 2. Toolchain setup (needed for C/C++ autobuild) ───────────────────
-      - name: Install build dependencies (C/C++)
+      # ── C/C++ build deps ──────────────────────────────────────────────────
+      - name: Install C/C++ build dependencies
         if: matrix.language == 'c-cpp'
         run: |
           sudo apt-get update -q
           sudo apt-get install -y \
+            autoconf automake pkg-config \
             libpcre2-dev libssl-dev libssh2-1-dev \
             libsnmp-dev libcurl4-openssl-dev \
             libldap2-dev libevent-dev \
             libmysqlclient-dev libpq-dev \
             libsqlite3-dev libopenipmi-dev \
-            pkg-config autoconf automake
+            libxml2-dev libssh-dev
 
-      # ── 3. Initialize CodeQL ───────────────────────────────────────────────
+      # ── Initialize CodeQL ─────────────────────────────────────────────────
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
-          queries: ${{ matrix.query-suite }}
-          # Extra query packs targeting Zabbix's specific CVE patterns:
-          #
-          #  security-extended  → adds CWE-89 (SQLi), CWE-787 (OOB write),
-          #                        CWE-416 (use-after-free), CWE-190 (int overflow)
-          #  security-and-quality → everything above + code-quality rules
-          #
-          # To add third-party packs (e.g. GitHub Advanced Security):
-          # packs: |
-          #   codeql/cpp-queries:codeql-suites/cpp-security-extended.qls
-          #   codeql/go-queries:codeql-suites/go-security-extended.qls
+          # ✅ Correct key is `queries:`, not `query-suite:`
+          queries: security-and-quality
           config: |
             paths-ignore:
               - "tests/**"
@@ -95,34 +78,35 @@ jobs:
               - "vendor/**"
               - "ui/vendor/**"
             query-filters:
-              # Keep ALL security queries; remove only pure style/metric noise
               - exclude:
                   tags contain: "maintainability"
                   precision: low
 
-      # ── 4. Manual build fallback ──────────────────────────────────────────
-      - name: Manual build (if autobuild failed)
-        if: matrix.build-mode == 'manual'
-        shell: bash
+      # ── Manual C/C++ build (bootstrap → configure → make) ─────────────────
+      # autobuild fails because configure.ac must be processed first
+      - name: Build C/C++ (manual)
+        if: matrix.language == 'c-cpp'
         run: |
           ./bootstrap.sh
           ./configure \
             --enable-server \
             --enable-agent \
             --enable-agent2 \
+            --enable-proxy \
             --with-mysql \
             --with-openssl \
             --with-libcurl \
             --with-ldap \
-            --with-libpcre2
+            --with-libpcre2 \
+            --with-net-snmp \
+            --with-libxml2 \
+            --with-ssh2
           make -j$(nproc)
 
-      # ── 5. Run analysis ───────────────────────────────────────────────────
+      # ── Analyze ───────────────────────────────────────────────────────────
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
         with:
           category: "/language:${{ matrix.language }}"
-          # Upload SARIF so results appear in the Security tab
           upload: true
-          # Keep RAM usage reasonable on standard runners
           ram: 6144
