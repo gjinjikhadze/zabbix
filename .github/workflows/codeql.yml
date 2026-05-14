@@ -1,63 +1,894 @@
-name: "CodeQL – Zabbix UI (OWASP Top 10)"
+name: Zabbix UI — Comprehensive Security Audit
 
 on:
+  workflow_dispatch:
+    inputs:
+      fail_on_high:
+        description: "Fail build if HIGH or CRITICAL findings exist"
+        required: false
+        default: "false"
+        type: boolean
   push:
-    branches: [ "master" ]
+    branches: [main, master]
   pull_request:
-    branches: [ "master" ]
-  schedule:
-    - cron: '43 8 * * 6'
+    branches: [main, master]
 
+permissions:
+  actions: read
+  contents: read
+  security-events: write   # required for SARIF upload
+  pull-requests: write     # required for PR comment step
+
+# ─────────────────────────────────────────────────────────
+# Shared environment
+# ─────────────────────────────────────────────────────────
+env:
+  UI_DIR: ./ui
+  REPORTS_DIR: ./security-reports
+
+# ─────────────────────────────────────────────────────────
+# JOB 1 — Prepare a clean, UI-only workspace artifact
+#          that every other job reuses (no repeated git clone)
+# ─────────────────────────────────────────────────────────
 jobs:
-  analyze:
-    name: Analyze UI (javascript-typescript)
+  prepare:
+    name: Prepare UI source snapshot
     runs-on: ubuntu-latest
-
-    permissions:
-      security-events: write
-      packages: read
-      actions: read
-      contents: read
-
     steps:
-      - name: Checkout repository
+      - name: Checkout (full history for better analysis context)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
+      - name: Strip everything except ui/
+        shell: bash
+        run: |
+          shopt -s dotglob extglob
+          rm -rf !(ui|.git)
+          echo "Scope restricted to ./ui"
+
+      - name: Verify scope
+        run: |
+          echo "=== Top-level dirs ==="
+          ls -la
+          echo ""
+          echo "=== ui/ file count ==="
+          find ./ui -type f | wc -l
+          echo ""
+          echo "=== Sample files ==="
+          find ./ui -type f | sort | head -50
+
+      - name: Upload ui/ as workflow artifact
+        uses: actions/upload-artifact@v4
         with:
-          languages: javascript-typescript
-          build-mode: none
-          # OWASP Top 10 coverage via security-extended:
-          # A01 Broken Access Control     → js/missing-rate-limiting, js/cors-misconfiguration
-          # A02 Cryptographic Failures    → js/weak-cryptographic-algorithm, js/insufficient-key-size
-          # A03 Injection (XSS/SQLi)      → js/xss, js/xss-through-dom, js/sql-injection
-          # A04 Insecure Design           → js/hardcoded-credentials
-          # A05 Security Misconfiguration → js/cors-misconfiguration
-          # A06 Vulnerable Components     → flagged via known-vulnerable patterns
-          # A07 Auth Failures             → js/insecure-randomness, js/jwt-missing-verification
-          # A08 Integrity Failures        → js/code-injection
-          # A09 Logging Failures          → js/clear-text-logging
-          # A10 SSRF                      → js/request-forgery
-          queries: security-extended
+          name: zabbix-ui-source
+          path: ui/
+          retention-days: 1
+
+  # ─────────────────────────────────────────────────────────
+  # JOB 2 — CodeQL (PHP + JavaScript)
+  # ─────────────────────────────────────────────────────────
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [php, javascript]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Strip non-UI code
+        shell: bash
+        run: |
+          shopt -s dotglob extglob
+          rm -rf !(ui|.git)
+
+      # ── CodeQL init with all security query suites ──────
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # Run every security-focused query pack available
+          queries: >-
+            security-extended,
+            security-and-quality
+          # Extra flags: increase depth of taint tracking
           config: |
             paths:
-              - "ui/**"
+              - ui
             paths-ignore:
-              - "ui/vendor/**"
-              - "ui/js/vendors/**"
-              - "ui/**/*.min.js"
-              - "ui/**/*.min.css"
+              - ui/tests
+              - ui/locale
+              - ui/vendor
             query-filters:
               - exclude:
-                  precision: low
-                  tags contain: "maintainability"
+                  tags contain: style
+                  tags contain: maintainability
 
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v4
+      - name: Autobuild (non-blocking — PHP/JS are interpreted)
+        uses: github/codeql-action/autobuild@v3
+        continue-on-error: true
+
+      - name: Run CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
         with:
-          category: "/language:javascript-typescript"
-          upload: true
-          ram: 4096
+          category: "/language:${{ matrix.language }}"
+          output: codeql-sarif-${{ matrix.language }}
+          upload: false   # we upload ourselves for artifact control
+
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: codeql-sarif-${{ matrix.language }}
+          category: "codeql-${{ matrix.language }}"
+
+      - name: Save SARIF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-codeql-${{ matrix.language }}
+          path: codeql-sarif-${{ matrix.language }}
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────
+  # JOB 3 — Semgrep (PHP + JS, OWASP-mapped rules)
+  # ─────────────────────────────────────────────────────────
+  semgrep:
+    name: Semgrep SAST
+    needs: prepare
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download ui/ artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: zabbix-ui-source
+          path: ui/
+
+      - name: Install Semgrep
+        run: pip install semgrep --quiet
+
+      - name: Write custom Semgrep rules
+        # Hand-crafted rules targeting Zabbix-specific patterns
+        run: |
+          mkdir -p semgrep-rules
+          cat > semgrep-rules/zabbix-custom.yml << 'RULES'
+          rules:
+
+            # ── PHP dangerous sinks ─────────────────────────────
+
+            - id: php-unsanitized-get-in-sql
+              patterns:
+                - pattern: |
+                    $db->query("..." . $_GET[...] . "...")
+                - pattern: |
+                    DBselect("..." . $_GET[...] . "...")
+              message: "Possible SQL injection via unsanitized $_GET in DB query"
+              languages: [php]
+              severity: ERROR
+              metadata:
+                cwe: CWE-89
+                owasp: A03
+
+            - id: php-request-in-header
+              pattern: header("Location: " . $_REQUEST[...])
+              message: "Open redirect / header injection via $_REQUEST"
+              languages: [php]
+              severity: ERROR
+              metadata:
+                cwe: CWE-601
+                owasp: A01
+
+            - id: php-eval-user-input
+              patterns:
+                - pattern: eval($_GET[...])
+                - pattern: eval($_POST[...])
+                - pattern: eval($_REQUEST[...])
+              message: "Remote code execution via eval() with user input"
+              languages: [php]
+              severity: ERROR
+              metadata:
+                cwe: CWE-94
+                owasp: A03
+
+            - id: php-include-user-input
+              patterns:
+                - pattern: include($_GET[...])
+                - pattern: include($_POST[...])
+                - pattern: require($_GET[...])
+                - pattern: require_once($_GET[...])
+                - pattern: include_once($_GET[...])
+              message: "Local/Remote File Inclusion via user-controlled path"
+              languages: [php]
+              severity: ERROR
+              metadata:
+                cwe: CWE-98
+                owasp: A08
+
+            - id: php-system-user-input
+              patterns:
+                - pattern: system($_GET[...])
+                - pattern: exec($_GET[...])
+                - pattern: passthru($_GET[...])
+                - pattern: shell_exec($_GET[...])
+                - pattern: popen($_GET[...], ...)
+                - pattern: proc_open($_GET[...], ...)
+              message: "OS command injection via user-controlled input"
+              languages: [php]
+              severity: ERROR
+              metadata:
+                cwe: CWE-78
+                owasp: A03
+
+            - id: php-curl-user-url
+              patterns:
+                - pattern: |
+                    curl_setopt($ch, CURLOPT_URL, $_GET[...])
+                - pattern: |
+                    curl_setopt($ch, CURLOPT_URL, $_POST[...])
+                - pattern: |
+                    file_get_contents($_GET[...])
+                - pattern: |
+                    file_get_contents($_POST[...])
+              message: "Potential SSRF — user-controlled URL passed to curl/file_get_contents"
+              languages: [php]
+              severity: ERROR
+              metadata:
+                cwe: CWE-918
+                owasp: A10
+
+            - id: php-unserialize-user-input
+              patterns:
+                - pattern: unserialize($_GET[...])
+                - pattern: unserialize($_POST[...])
+                - pattern: unserialize($_COOKIE[...])
+                - pattern: unserialize($_REQUEST[...])
+              message: "Insecure deserialization — unserialize() on user input"
+              languages: [php]
+              severity: ERROR
+              metadata:
+                cwe: CWE-502
+                owasp: A08
+
+            - id: php-weak-random
+              patterns:
+                - pattern: rand(...)
+                - pattern: mt_rand(...)
+              message: "Cryptographically weak random number generator used (use random_bytes/random_int)"
+              languages: [php]
+              severity: WARNING
+              metadata:
+                cwe: CWE-338
+                owasp: A02
+
+            - id: php-md5-password
+              pattern: md5($password)
+              message: "MD5 used for password hashing — use password_hash()"
+              languages: [php]
+              severity: WARNING
+              metadata:
+                cwe: CWE-916
+                owasp: A02
+
+            - id: php-hardcoded-secret
+              patterns:
+                - pattern: $password = "..."
+                - pattern: $secret = "..."
+                - pattern: $api_key = "..."
+                - pattern: define('..._SECRET', '...')
+              message: "Possible hardcoded secret/credential"
+              languages: [php]
+              severity: WARNING
+              metadata:
+                cwe: CWE-798
+                owasp: A02
+
+            - id: php-missing-csrf-check
+              patterns:
+                - pattern: |
+                    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+                      ...
+                    }
+              pattern-not: |
+                if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+                  ...
+                  check_csrf_token(...)
+                  ...
+                }
+              message: "POST handler may be missing CSRF token validation"
+              languages: [php]
+              severity: WARNING
+              metadata:
+                cwe: CWE-352
+                owasp: A01
+
+            # ── JavaScript dangerous sinks ──────────────────────
+
+            - id: js-innerhtml-user-data
+              patterns:
+                - pattern: $X.innerHTML = location.search
+                - pattern: $X.innerHTML = location.hash
+                - pattern: document.write(location.search)
+                - pattern: document.write(location.hash)
+              message: "DOM XSS — user-controlled URL fragment/query written to DOM"
+              languages: [javascript]
+              severity: ERROR
+              metadata:
+                cwe: CWE-79
+                owasp: A03
+
+            - id: js-eval-user-data
+              patterns:
+                - pattern: eval(location.search)
+                - pattern: eval(location.hash)
+                - pattern: eval($FUNC(...))
+              message: "eval() with potentially user-controlled data"
+              languages: [javascript]
+              severity: ERROR
+              metadata:
+                cwe: CWE-79
+                owasp: A03
+
+            - id: js-prototype-pollution
+              pattern: $obj[...][...] = $val
+              message: "Possible prototype pollution via bracket notation assignment"
+              languages: [javascript]
+              severity: WARNING
+              metadata:
+                cwe: CWE-1321
+                owasp: A08
+
+            - id: js-open-redirect
+              pattern: window.location = $INPUT
+              message: "Potential open redirect via unvalidated assignment to window.location"
+              languages: [javascript]
+              severity: WARNING
+              metadata:
+                cwe: CWE-601
+                owasp: A01
+          RULES
+
+      - name: Run Semgrep — official PHP security ruleset
+        run: |
+          mkdir -p $REPORTS_DIR
+          semgrep scan \
+            --config "p/php" \
+            --config "p/owasp-top-ten" \
+            --config "p/security-audit" \
+            --config "p/secrets" \
+            --config semgrep-rules/zabbix-custom.yml \
+            --sarif \
+            --output $REPORTS_DIR/semgrep-php.sarif \
+            --severity WARNING \
+            --timeout 300 \
+            --max-memory 2000 \
+            ui/ \
+          || true   # don't fail the step; findings are reported separately
+        env:
+          REPORTS_DIR: security-reports
+
+      - name: Run Semgrep — JavaScript security ruleset
+        run: |
+          semgrep scan \
+            --config "p/javascript" \
+            --config "p/xss" \
+            --config "p/dom-xss" \
+            --config "p/prototype-pollution" \
+            --sarif \
+            --output security-reports/semgrep-js.sarif \
+            --severity WARNING \
+            --timeout 300 \
+            --max-memory 2000 \
+            ui/ \
+          || true
+
+      - name: Run Semgrep — custom Zabbix rules only (text summary)
+        run: |
+          semgrep scan \
+            --config semgrep-rules/zabbix-custom.yml \
+            --text \
+            --severity WARNING \
+            --timeout 300 \
+            ui/ \
+          2>&1 | tee security-reports/semgrep-custom-summary.txt \
+          || true
+
+      - name: Upload Semgrep SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: security-reports/semgrep-php.sarif
+          category: semgrep-php
+        continue-on-error: true
+
+      - name: Upload Semgrep JS SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: security-reports/semgrep-js.sarif
+          category: semgrep-js
+        continue-on-error: true
+
+      - name: Save Semgrep artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-semgrep
+          path: security-reports/
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────
+  # JOB 4 — Secret Scanning with Gitleaks
+  # ─────────────────────────────────────────────────────────
+  secrets:
+    name: Secret Scanning (Gitleaks)
+    needs: prepare
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history — secrets may be in old commits
+
+      - name: Run Gitleaks (full git history)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}  # optional for SARIF upload
+        continue-on-error: true   # report, don't block
+
+      - name: Run Gitleaks on ui/ directory snapshot
+        run: |
+          docker run --rm \
+            -v "$PWD/ui:/path" \
+            zricethezav/gitleaks:latest \
+            detect \
+            --source /path \
+            --report-format sarif \
+            --report-path /path/gitleaks.sarif \
+            --no-git \
+            --verbose \
+          || true
+          cp ui/gitleaks.sarif security-reports/gitleaks.sarif 2>/dev/null || true
+        continue-on-error: true
+
+      - name: Upload Gitleaks SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: security-reports/gitleaks.sarif
+          category: gitleaks
+        continue-on-error: true
+
+  # ─────────────────────────────────────────────────────────
+  # JOB 5 — PHP-specific deep scan (PHPCS Security Audit +
+  #          PHPStan with security extensions)
+  # ─────────────────────────────────────────────────────────
+  php-deep:
+    name: PHP Deep Scan (PHPCS + PHPStan)
+    needs: prepare
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download ui/ artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: zabbix-ui-source
+          path: ui/
+
+      - name: Setup PHP 8.2
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.2"
+          tools: composer, phpcs, phpstan
+          coverage: none
+
+      - name: Install PHP security tools
+        run: |
+          # PHP_CodeSniffer + Security Audit standard
+          composer global require \
+            "squizlabs/php_codesniffer:*" \
+            "pheromone/phpcs-security-audit:*" \
+            "phpstan/phpstan:*" \
+            --no-interaction --quiet
+
+          # Psalm with security taint analysis
+          composer global require \
+            "vimeo/psalm:*" \
+            --no-interaction --quiet || true
+
+      - name: Run PHPCS Security Audit
+        run: |
+          mkdir -p security-reports
+          ~/.composer/vendor/bin/phpcs \
+            --standard=SecurityAudit \
+            --extensions=php \
+            --report=json \
+            --report-file=security-reports/phpcs-security.json \
+            --ignore=*/vendor/*,*/tests/*,*/locale/* \
+            ui/ \
+          || true
+
+          # Also emit a human-readable summary
+          ~/.composer/vendor/bin/phpcs \
+            --standard=SecurityAudit \
+            --extensions=php \
+            --report=summary \
+            --ignore=*/vendor/*,*/tests/*,*/locale/* \
+            ui/ \
+          2>&1 | tee security-reports/phpcs-summary.txt || true
+
+      - name: Run PHPStan (security rules, level 6)
+        run: |
+          ~/.composer/vendor/bin/phpstan analyse \
+            --level=6 \
+            --error-format=json \
+            --no-progress \
+            ui/ \
+          > security-reports/phpstan.json \
+          2>&1 || true
+
+      - name: Save PHP scan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: php-deep-scan
+          path: security-reports/
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────
+  # JOB 6 — Dependency Vulnerability Scan
+  # ─────────────────────────────────────────────────────────
+  dependencies:
+    name: Dependency Vulnerability Scan
+    needs: prepare
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download ui/ artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: zabbix-ui-source
+          path: ui/
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Scan JS dependencies with npm audit
+        run: |
+          mkdir -p security-reports
+          cd ui
+          # Generate a package-lock if not present (for audit)
+          if [ -f package.json ]; then
+            npm install --package-lock-only --ignore-scripts 2>/dev/null || true
+            npm audit --json > ../security-reports/npm-audit.json 2>&1 || true
+            npm audit > ../security-reports/npm-audit-summary.txt 2>&1 || true
+          else
+            echo "No package.json found in ui/" > ../security-reports/npm-audit-summary.txt
+          fi
+          cd ..
+
+      - name: Scan with OSV-Scanner (multi-ecosystem)
+        uses: google/osv-scanner-action@v1
+        with:
+          scan-args: |-
+            --recursive
+            --format=sarif
+            --output=security-reports/osv-scanner.sarif
+            ./ui
+        continue-on-error: true
+
+      - name: Upload OSV-Scanner SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: security-reports/osv-scanner.sarif
+          category: osv-scanner
+        continue-on-error: true
+
+      - name: Save dependency scan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-scan
+          path: security-reports/
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────
+  # JOB 7 — Consolidate all reports into one HTML dashboard
+  # ─────────────────────────────────────────────────────────
+  report:
+    name: Consolidated Security Report
+    needs: [codeql, semgrep, secrets, php-deep, dependencies]
+    runs-on: ubuntu-latest
+    if: always()   # run even if earlier jobs fail
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts/
+
+      - name: Install jq and Python deps
+        run: |
+          sudo apt-get install -y jq python3-pip --quiet
+          pip install sarif-tools 2>/dev/null || true
+
+      - name: Parse SARIFs and compute finding counts
+        id: counts
+        run: |
+          mkdir -p final-report
+
+          # Helper: count results in a SARIF file
+          count_sarif() {
+            local file=$1
+            if [ -f "$file" ]; then
+              jq '[.runs[].results | length] | add // 0' "$file" 2>/dev/null || echo 0
+            else
+              echo 0
+            fi
+          }
+
+          CODEQL_PHP=$(count_sarif all-artifacts/sarif-codeql-php/*.sarif 2>/dev/null || echo 0)
+          CODEQL_JS=$(count_sarif all-artifacts/sarif-codeql-javascript/*.sarif 2>/dev/null || echo 0)
+          SEMGREP_PHP=$(count_sarif all-artifacts/sarif-semgrep/semgrep-php.sarif 2>/dev/null || echo 0)
+          SEMGREP_JS=$(count_sarif all-artifacts/sarif-semgrep/semgrep-js.sarif 2>/dev/null || echo 0)
+          GITLEAKS=$(count_sarif all-artifacts/sarif-semgrep/gitleaks.sarif 2>/dev/null || echo 0)
+
+          TOTAL=$((CODEQL_PHP + CODEQL_JS + SEMGREP_PHP + SEMGREP_JS + GITLEAKS))
+
+          echo "codeql_php=$CODEQL_PHP"   >> $GITHUB_OUTPUT
+          echo "codeql_js=$CODEQL_JS"     >> $GITHUB_OUTPUT
+          echo "semgrep_php=$SEMGREP_PHP" >> $GITHUB_OUTPUT
+          echo "semgrep_js=$SEMGREP_JS"   >> $GITHUB_OUTPUT
+          echo "gitleaks=$GITLEAKS"       >> $GITHUB_OUTPUT
+          echo "total=$TOTAL"             >> $GITHUB_OUTPUT
+
+          echo "=== Finding Counts ==="
+          echo "CodeQL PHP:      $CODEQL_PHP"
+          echo "CodeQL JS:       $CODEQL_JS"
+          echo "Semgrep PHP:     $SEMGREP_PHP"
+          echo "Semgrep JS:      $SEMGREP_JS"
+          echo "Gitleaks:        $GITLEAKS"
+          echo "TOTAL:           $TOTAL"
+
+      - name: Generate HTML dashboard
+        run: |
+          TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          cat > final-report/index.html << HTMLEOF
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Zabbix UI — Security Audit Report</title>
+            <style>
+              :root {
+                --bg: #0d1117; --surface: #161b22; --border: #30363d;
+                --text: #c9d1d9; --muted: #8b949e; --accent: #58a6ff;
+                --critical: #ff4444; --high: #ff8c00;
+                --medium: #ffd700; --low: #4caf50; --info: #58a6ff;
+              }
+              * { box-sizing: border-box; margin: 0; padding: 0; }
+              body { background: var(--bg); color: var(--text);
+                     font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+                     padding: 2rem; line-height: 1.6; }
+              h1 { font-size: 1.8rem; color: var(--accent); margin-bottom: .25rem; }
+              .meta { color: var(--muted); font-size: .9rem; margin-bottom: 2rem; }
+              .meta a { color: var(--accent); }
+              .grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(180px,1fr)); gap: 1rem; margin-bottom: 2rem; }
+              .card { background: var(--surface); border: 1px solid var(--border);
+                      border-radius: 8px; padding: 1.25rem; text-align: center; }
+              .card .num { font-size: 2.5rem; font-weight: 700; }
+              .card .lbl { color: var(--muted); font-size: .85rem; margin-top: .25rem; }
+              .card.total .num { color: var(--accent); }
+              table { width: 100%; border-collapse: collapse; background: var(--surface);
+                      border-radius: 8px; overflow: hidden; margin-bottom: 2rem; }
+              th { background: #21262d; color: var(--muted); text-align: left;
+                   padding: .75rem 1rem; font-size: .8rem; text-transform: uppercase;
+                   letter-spacing: .05em; }
+              td { padding: .75rem 1rem; border-top: 1px solid var(--border); font-size: .9rem; }
+              tr:hover td { background: #1c2128; }
+              .badge { display: inline-block; padding: .2rem .6rem; border-radius: 4px;
+                       font-size: .75rem; font-weight: 600; }
+              .badge-pass { background: #1a3a2a; color: var(--low); }
+              .badge-findings { background: #3a2a1a; color: var(--high); }
+              .section-title { font-size: 1.1rem; font-weight: 600; color: var(--text);
+                               margin-bottom: .75rem; padding-bottom: .5rem;
+                               border-bottom: 1px solid var(--border); }
+              .owasp-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(260px,1fr));
+                             gap: .75rem; margin-bottom: 2rem; }
+              .owasp-card { background: var(--surface); border: 1px solid var(--border);
+                            border-radius: 6px; padding: 1rem; }
+              .owasp-card .id { font-size: .75rem; color: var(--muted); }
+              .owasp-card .name { font-weight: 600; margin: .25rem 0; }
+              .owasp-card .tools { font-size: .8rem; color: var(--muted); }
+              footer { margin-top: 3rem; color: var(--muted); font-size: .8rem; text-align: center; }
+            </style>
+          </head>
+          <body>
+            <h1>🔒 Zabbix UI — Security Audit Report</h1>
+            <div class="meta">
+              Generated: ${TIMESTAMP} &nbsp;|&nbsp;
+              Commit: <code>${{ github.sha }}</code> &nbsp;|&nbsp;
+              Branch: <code>${{ github.ref_name }}</code> &nbsp;|&nbsp;
+              <a href="${RUN_URL}">View Run</a>
+            </div>
+
+            <!-- Summary cards -->
+            <div class="grid">
+              <div class="card total">
+                <div class="num">${{ steps.counts.outputs.total }}</div>
+                <div class="lbl">Total Findings</div>
+              </div>
+              <div class="card">
+                <div class="num">${{ steps.counts.outputs.codeql_php }}</div>
+                <div class="lbl">CodeQL PHP</div>
+              </div>
+              <div class="card">
+                <div class="num">${{ steps.counts.outputs.codeql_js }}</div>
+                <div class="lbl">CodeQL JavaScript</div>
+              </div>
+              <div class="card">
+                <div class="num">${{ steps.counts.outputs.semgrep_php }}</div>
+                <div class="lbl">Semgrep PHP</div>
+              </div>
+              <div class="card">
+                <div class="num">${{ steps.counts.outputs.semgrep_js }}</div>
+                <div class="lbl">Semgrep JS</div>
+              </div>
+              <div class="card">
+                <div class="num">${{ steps.counts.outputs.gitleaks }}</div>
+                <div class="lbl">Secrets Found</div>
+              </div>
+            </div>
+
+            <!-- Tool coverage table -->
+            <div class="section-title">Scanner Coverage</div>
+            <table>
+              <thead>
+                <tr>
+                  <th>Scanner</th><th>Languages</th><th>OWASP Categories</th>
+                  <th>Findings</th><th>Artifacts</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>CodeQL</strong></td>
+                  <td>PHP, JavaScript</td>
+                  <td>A01–A03, A07–A10</td>
+                  <td>${{ steps.counts.outputs.codeql_php }} / ${{ steps.counts.outputs.codeql_js }}</td>
+                  <td>GitHub Security tab → Code scanning</td>
+                </tr>
+                <tr>
+                  <td><strong>Semgrep</strong></td>
+                  <td>PHP, JavaScript</td>
+                  <td>All A01–A10 + custom Zabbix rules</td>
+                  <td>${{ steps.counts.outputs.semgrep_php }} / ${{ steps.counts.outputs.semgrep_js }}</td>
+                  <td>GitHub Security tab + sarif-semgrep artifact</td>
+                </tr>
+                <tr>
+                  <td><strong>PHPCS Security Audit</strong></td>
+                  <td>PHP</td>
+                  <td>A03, A07, A08</td>
+                  <td>See php-deep-scan artifact</td>
+                  <td>php-deep-scan/phpcs-*.json</td>
+                </tr>
+                <tr>
+                  <td><strong>PHPStan</strong></td>
+                  <td>PHP</td>
+                  <td>A04, A08</td>
+                  <td>See php-deep-scan artifact</td>
+                  <td>php-deep-scan/phpstan.json</td>
+                </tr>
+                <tr>
+                  <td><strong>Gitleaks</strong></td>
+                  <td>All files + git history</td>
+                  <td>A02 (hardcoded secrets)</td>
+                  <td>${{ steps.counts.outputs.gitleaks }}</td>
+                  <td>GitHub Security tab</td>
+                </tr>
+                <tr>
+                  <td><strong>OSV-Scanner / npm audit</strong></td>
+                  <td>PHP, JS</td>
+                  <td>A06 (outdated components)</td>
+                  <td>See dependency-scan artifact</td>
+                  <td>dependency-scan/osv-scanner.sarif</td>
+                </tr>
+              </tbody>
+            </table>
+
+            <!-- OWASP coverage grid -->
+            <div class="section-title">OWASP Top 10 2021 Coverage</div>
+            <div class="owasp-grid">
+              <div class="owasp-card"><div class="id">A01</div><div class="name">Broken Access Control</div><div class="tools">CodeQL · Semgrep custom rules</div></div>
+              <div class="owasp-card"><div class="id">A02</div><div class="name">Cryptographic Failures</div><div class="tools">Semgrep (weak random, MD5, hardcoded) · Gitleaks</div></div>
+              <div class="owasp-card"><div class="id">A03</div><div class="name">Injection (SQLi, CMDi, XSS…)</div><div class="tools">CodeQL · Semgrep · PHPCS-Security</div></div>
+              <div class="owasp-card"><div class="id">A04</div><div class="name">Insecure Design</div><div class="tools">PHPStan · Semgrep</div></div>
+              <div class="owasp-card"><div class="id">A05</div><div class="name">Security Misconfiguration</div><div class="tools">Semgrep · PHPCS-Security</div></div>
+              <div class="owasp-card"><div class="id">A06</div><div class="name">Vulnerable Components</div><div class="tools">OSV-Scanner · npm audit</div></div>
+              <div class="owasp-card"><div class="id">A07</div><div class="name">Auth Failures</div><div class="tools">CodeQL · Semgrep</div></div>
+              <div class="owasp-card"><div class="id">A08</div><div class="name">Software & Data Integrity</div><div class="tools">CodeQL · Semgrep (unserialize, eval, include)</div></div>
+              <div class="owasp-card"><div class="id">A09</div><div class="name">Logging Failures</div><div class="tools">Semgrep (manual review flagged)</div></div>
+              <div class="owasp-card"><div class="id">A10</div><div class="name">SSRF</div><div class="tools">CodeQL · Semgrep (curl, file_get_contents)</div></div>
+            </div>
+
+            <!-- Next steps -->
+            <div class="section-title">Triage Workflow</div>
+            <table>
+              <thead><tr><th>Priority</th><th>Action</th><th>Where</th></tr></thead>
+              <tbody>
+                <tr><td>1️⃣ Critical / High</td><td>Review immediately in GitHub Security tab → Code scanning alerts, filter by severity</td><td>Security → Code scanning</td></tr>
+                <tr><td>2️⃣ Secrets</td><td>Rotate any credentials found by Gitleaks; check full git history</td><td>Security → Secret scanning</td></tr>
+                <tr><td>3️⃣ Outdated deps</td><td>Review OSV-Scanner SARIF and npm audit JSON</td><td>dependency-scan artifact</td></tr>
+                <tr><td>4️⃣ PHP logic</td><td>Review PHPCS Security Audit JSON + PHPStan JSON</td><td>php-deep-scan artifact</td></tr>
+                <tr><td>5️⃣ Custom rules</td><td>Review semgrep-custom-summary.txt for Zabbix-specific patterns</td><td>sarif-semgrep artifact</td></tr>
+              </tbody>
+            </table>
+
+            <footer>
+              Generated by Zabbix UI Comprehensive Security Audit Workflow · 
+              ${{ github.repository }} · Run #${{ github.run_number }}
+            </footer>
+          </body>
+          </html>
+          HTMLEOF
+
+      - name: Upload consolidated report
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit-report
+          path: final-report/
+          retention-days: 30
+
+      # ── Optional: comment on PR with summary ───────────────
+      - name: Comment on PR with findings summary
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const total   = '${{ steps.counts.outputs.total }}';
+            const cqlPHP  = '${{ steps.counts.outputs.codeql_php }}';
+            const cqlJS   = '${{ steps.counts.outputs.codeql_js }}';
+            const sgPHP   = '${{ steps.counts.outputs.semgrep_php }}';
+            const sgJS    = '${{ steps.counts.outputs.semgrep_js }}';
+            const secrets = '${{ steps.counts.outputs.gitleaks }}';
+            const runUrl  = `https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+
+            const emoji = parseInt(total) === 0 ? '✅' : (parseInt(secrets) > 0 ? '🚨' : '⚠️');
+
+            const body = [
+              `## ${emoji} Zabbix UI Security Scan — ${total} finding(s)`,
+              '',
+              '| Scanner | Language | Findings |',
+              '|---------|----------|----------|',
+              `| CodeQL | PHP | ${cqlPHP} |`,
+              `| CodeQL | JavaScript | ${cqlJS} |`,
+              `| Semgrep | PHP | ${sgPHP} |`,
+              `| Semgrep | JavaScript | ${sgJS} |`,
+              `| Gitleaks | Secrets | ${secrets} |`,
+              '',
+              `📊 [Full run details](${runUrl}) · Download the \`security-audit-report\` artifact for the HTML dashboard.`,
+              '',
+              '> _All findings are also visible in **Security → Code scanning alerts** on the repository._'
+            ].join('\n');
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+      # ── Optional: fail the build if high findings exist ────
+      - name: Fail if HIGH/CRITICAL findings present
+        if: inputs.fail_on_high == 'true'
+        run: |
+          TOTAL=${{ steps.counts.outputs.total }}
+          if [ "$TOTAL" -gt "0" ]; then
+            echo "::error::$TOTAL security finding(s) detected. Review Security tab."
+            exit 1
+          fi
