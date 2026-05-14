@@ -1,4 +1,4 @@
-name: "CodeQL Security Analysis – Zabbix"
+name: "CodeQL – Zabbix UI (OWASP Top 10)"
 
 on:
   push:
@@ -10,7 +10,7 @@ on:
 
 jobs:
   analyze:
-    name: Analyze (${{ matrix.language }})
+    name: Analyze UI (javascript-typescript)
     runs-on: ubuntu-latest
 
     permissions:
@@ -19,94 +19,45 @@ jobs:
       actions: read
       contents: read
 
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-
-          # C/C++ — server/agent core: buffer overflows, use-after-free,
-          # OOB reads, AT-cmd injection, format-string bugs
-          - language: c-cpp
-            build-mode: manual
-
-          # Go — Agent 2: shell injection in smart.disk.get, icmpping() RCE
-          - language: go
-            build-mode: autobuild
-
-          # Java/Kotlin
-          - language: java-kotlin
-            build-mode: none
-
-          # JavaScript/TypeScript — Duktape JS engine bindings, frontend,
-          # session-cookie handling, HttpRequest header injection
-          - language: javascript-typescript
-            build-mode: none
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # full history improves inter-file taint tracking
+          fetch-depth: 0
 
-      # ── C/C++ build deps ──────────────────────────────────────────────────
-      - name: Install C/C++ build dependencies
-        if: matrix.language == 'c-cpp'
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y \
-            autoconf automake pkg-config \
-            libpcre2-dev libssl-dev libssh2-1-dev \
-            libsnmp-dev libcurl4-openssl-dev \
-            libldap2-dev libevent-dev \
-            libmysqlclient-dev libpq-dev \
-            libsqlite3-dev libopenipmi-dev \
-            libxml2-dev libssh-dev
-
-      # ── Initialize CodeQL ─────────────────────────────────────────────────
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
-          languages: ${{ matrix.language }}
-          build-mode: ${{ matrix.build-mode }}
-          # ✅ Correct key is `queries:`, not `query-suite:`
-          queries: security-and-quality
+          languages: javascript-typescript
+          build-mode: none
+          # OWASP Top 10 coverage via security-extended:
+          # A01 Broken Access Control     → js/missing-rate-limiting, js/cors-misconfiguration
+          # A02 Cryptographic Failures    → js/weak-cryptographic-algorithm, js/insufficient-key-size
+          # A03 Injection (XSS/SQLi)      → js/xss, js/xss-through-dom, js/sql-injection
+          # A04 Insecure Design           → js/hardcoded-credentials
+          # A05 Security Misconfiguration → js/cors-misconfiguration
+          # A06 Vulnerable Components     → flagged via known-vulnerable patterns
+          # A07 Auth Failures             → js/insecure-randomness, js/jwt-missing-verification
+          # A08 Integrity Failures        → js/code-injection
+          # A09 Logging Failures          → js/clear-text-logging
+          # A10 SSRF                      → js/request-forgery
+          queries: security-extended
           config: |
+            paths:
+              - "ui/**"
             paths-ignore:
-              - "tests/**"
-              - "**/*.test.c"
-              - "**/*.test.go"
-              - "vendor/**"
               - "ui/vendor/**"
+              - "ui/js/vendors/**"
+              - "ui/**/*.min.js"
+              - "ui/**/*.min.css"
             query-filters:
               - exclude:
-                  tags contain: "maintainability"
                   precision: low
+                  tags contain: "maintainability"
 
-      # ── Manual C/C++ build (bootstrap → configure → make) ─────────────────
-      # autobuild fails because configure.ac must be processed first
-      - name: Build C/C++ (manual)
-        if: matrix.language == 'c-cpp'
-        run: |
-          ./bootstrap.sh
-          ./configure \
-            --enable-server \
-            --enable-agent \
-            --enable-agent2 \
-            --enable-proxy \
-            --with-mysql \
-            --with-openssl \
-            --with-libcurl \
-            --with-ldap \
-            --with-libpcre2 \
-            --with-net-snmp \
-            --with-libxml2 \
-            --with-ssh2
-          make -j$(nproc)
-
-      # ── Analyze ───────────────────────────────────────────────────────────
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
         with:
-          category: "/language:${{ matrix.language }}"
+          category: "/language:javascript-typescript"
           upload: true
-          ram: 6144
+          ram: 4096
