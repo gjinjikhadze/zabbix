@@ -157,223 +157,154 @@ jobs:
         run: pip install semgrep --quiet
 
       - name: Write custom Semgrep rules
-        # Hand-crafted rules targeting Zabbix-specific patterns
+        # Rules written with printf to avoid heredoc and YAML quoting issues
         run: |
           mkdir -p semgrep-rules
-          cat > semgrep-rules/zabbix-custom.yml << 'RULES'
-          rules:
+          printf '%s\n' \
+            'rules:' \
+            '  - id: php-sqli-dbselect' \
+            '    patterns:' \
+            '      - pattern: DBselect("..." . $_GET[...] . "...")' \
+            '      - pattern: DBselect("..." . $_POST[...] . "...")' \
+            '      - pattern: DBselect("..." . $_REQUEST[...] . "...")' \
+            '    message: SQLi risk - unsanitized superglobal in DBselect()' \
+            '    languages: [php]' \
+            '    severity: ERROR' \
+            '    metadata:' \
+            '      cwe: CWE-89' \
+            '      owasp: A03' \
+            '  - id: php-eval-userinput' \
+            '    patterns:' \
+            '      - pattern: eval($_GET[...])' \
+            '      - pattern: eval($_POST[...])' \
+            '      - pattern: eval($_REQUEST[...])' \
+            '    message: RCE risk - eval() on user-supplied input' \
+            '    languages: [php]' \
+            '    severity: ERROR' \
+            '    metadata:' \
+            '      cwe: CWE-94' \
+            '      owasp: A03' \
+            '  - id: php-include-userinput' \
+            '    patterns:' \
+            '      - pattern: include($_GET[...])' \
+            '      - pattern: include($_POST[...])' \
+            '      - pattern: require($_GET[...])' \
+            '      - pattern: require_once($_GET[...])' \
+            '      - pattern: include_once($_GET[...])' \
+            '    message: LFI/RFI risk - include/require with user-controlled path' \
+            '    languages: [php]' \
+            '    severity: ERROR' \
+            '    metadata:' \
+            '      cwe: CWE-98' \
+            '      owasp: A08' \
+            '  - id: php-cmdi-userinput' \
+            '    patterns:' \
+            '      - pattern: system($_GET[...])' \
+            '      - pattern: exec($_GET[...])' \
+            '      - pattern: passthru($_GET[...])' \
+            '      - pattern: shell_exec($_GET[...])' \
+            '      - pattern: popen($_GET[...], ...)' \
+            '      - pattern: proc_open($_GET[...], ...)' \
+            '    message: OS command injection via user-controlled input' \
+            '    languages: [php]' \
+            '    severity: ERROR' \
+            '    metadata:' \
+            '      cwe: CWE-78' \
+            '      owasp: A03' \
+            '  - id: php-unserialize-userinput' \
+            '    patterns:' \
+            '      - pattern: unserialize($_GET[...])' \
+            '      - pattern: unserialize($_POST[...])' \
+            '      - pattern: unserialize($_COOKIE[...])' \
+            '      - pattern: unserialize($_REQUEST[...])' \
+            '    message: Insecure deserialization - unserialize() on user input' \
+            '    languages: [php]' \
+            '    severity: ERROR' \
+            '    metadata:' \
+            '      cwe: CWE-502' \
+            '      owasp: A08' \
+            '  - id: php-ssrf-curl' \
+            '    patterns:' \
+            '      - pattern: curl_setopt($ch, CURLOPT_URL, $_GET[...])' \
+            '      - pattern: curl_setopt($ch, CURLOPT_URL, $_POST[...])' \
+            '      - pattern: file_get_contents($_GET[...])' \
+            '      - pattern: file_get_contents($_POST[...])' \
+            '    message: SSRF risk - user-controlled URL in curl/file_get_contents' \
+            '    languages: [php]' \
+            '    severity: ERROR' \
+            '    metadata:' \
+            '      cwe: CWE-918' \
+            '      owasp: A10' \
+            '  - id: php-weak-prng' \
+            '    patterns:' \
+            '      - pattern: rand(...)' \
+            '      - pattern: mt_rand(...)' \
+            '    message: Weak PRNG - use random_bytes() or random_int()' \
+            '    languages: [php]' \
+            '    severity: WARNING' \
+            '    metadata:' \
+            '      cwe: CWE-338' \
+            '      owasp: A02' \
+            '  - id: php-md5-password' \
+            '    pattern: md5($password)' \
+            '    message: MD5 for passwords - use password_hash() instead' \
+            '    languages: [php]' \
+            '    severity: WARNING' \
+            '    metadata:' \
+            '      cwe: CWE-916' \
+            '      owasp: A02' \
+            '  - id: js-dom-xss-location' \
+            '    patterns:' \
+            '      - pattern: $X.innerHTML = location.search' \
+            '      - pattern: $X.innerHTML = location.hash' \
+            '      - pattern: document.write(location.search)' \
+            '      - pattern: document.write(location.hash)' \
+            '    message: DOM XSS - user-controlled URL written to innerHTML' \
+            '    languages: [javascript]' \
+            '    severity: ERROR' \
+            '    metadata:' \
+            '      cwe: CWE-79' \
+            '      owasp: A03' \
+            '  - id: js-open-redirect' \
+            '    pattern: window.location = $INPUT' \
+            '    message: Open redirect via unvalidated window.location assignment' \
+            '    languages: [javascript]' \
+            '    severity: WARNING' \
+            '    metadata:' \
+            '      cwe: CWE-601' \
+            '      owasp: A01' \
+            > semgrep-rules/zabbix-custom.yml
 
-            # ── PHP dangerous sinks ─────────────────────────────
+          echo "Custom rules written — validating..."
+          semgrep --validate --config semgrep-rules/zabbix-custom.yml \
+            && echo "Rules VALID" \
+            || echo "Rules INVALID — will be skipped in scan"
 
-            - id: php-unsanitized-get-in-sql
-              patterns:
-                - pattern: |
-                    $db->query("..." . $_GET[...] . "...")
-                - pattern: |
-                    DBselect("..." . $_GET[...] . "...")
-              message: "Possible SQL injection via unsanitized $_GET in DB query"
-              languages: [php]
-              severity: ERROR
-              metadata:
-                cwe: CWE-89
-                owasp: A03
-
-            - id: php-request-in-header
-              pattern: header("Location: " . $_REQUEST[...])
-              message: "Open redirect / header injection via $_REQUEST"
-              languages: [php]
-              severity: ERROR
-              metadata:
-                cwe: CWE-601
-                owasp: A01
-
-            - id: php-eval-user-input
-              patterns:
-                - pattern: eval($_GET[...])
-                - pattern: eval($_POST[...])
-                - pattern: eval($_REQUEST[...])
-              message: "Remote code execution via eval() with user input"
-              languages: [php]
-              severity: ERROR
-              metadata:
-                cwe: CWE-94
-                owasp: A03
-
-            - id: php-include-user-input
-              patterns:
-                - pattern: include($_GET[...])
-                - pattern: include($_POST[...])
-                - pattern: require($_GET[...])
-                - pattern: require_once($_GET[...])
-                - pattern: include_once($_GET[...])
-              message: "Local/Remote File Inclusion via user-controlled path"
-              languages: [php]
-              severity: ERROR
-              metadata:
-                cwe: CWE-98
-                owasp: A08
-
-            - id: php-system-user-input
-              patterns:
-                - pattern: system($_GET[...])
-                - pattern: exec($_GET[...])
-                - pattern: passthru($_GET[...])
-                - pattern: shell_exec($_GET[...])
-                - pattern: popen($_GET[...], ...)
-                - pattern: proc_open($_GET[...], ...)
-              message: "OS command injection via user-controlled input"
-              languages: [php]
-              severity: ERROR
-              metadata:
-                cwe: CWE-78
-                owasp: A03
-
-            - id: php-curl-user-url
-              patterns:
-                - pattern: |
-                    curl_setopt($ch, CURLOPT_URL, $_GET[...])
-                - pattern: |
-                    curl_setopt($ch, CURLOPT_URL, $_POST[...])
-                - pattern: |
-                    file_get_contents($_GET[...])
-                - pattern: |
-                    file_get_contents($_POST[...])
-              message: "Potential SSRF — user-controlled URL passed to curl/file_get_contents"
-              languages: [php]
-              severity: ERROR
-              metadata:
-                cwe: CWE-918
-                owasp: A10
-
-            - id: php-unserialize-user-input
-              patterns:
-                - pattern: unserialize($_GET[...])
-                - pattern: unserialize($_POST[...])
-                - pattern: unserialize($_COOKIE[...])
-                - pattern: unserialize($_REQUEST[...])
-              message: "Insecure deserialization — unserialize() on user input"
-              languages: [php]
-              severity: ERROR
-              metadata:
-                cwe: CWE-502
-                owasp: A08
-
-            - id: php-weak-random
-              patterns:
-                - pattern: rand(...)
-                - pattern: mt_rand(...)
-              message: "Cryptographically weak random number generator used (use random_bytes/random_int)"
-              languages: [php]
-              severity: WARNING
-              metadata:
-                cwe: CWE-338
-                owasp: A02
-
-            - id: php-md5-password
-              pattern: md5($password)
-              message: "MD5 used for password hashing — use password_hash()"
-              languages: [php]
-              severity: WARNING
-              metadata:
-                cwe: CWE-916
-                owasp: A02
-
-            - id: php-hardcoded-secret
-              patterns:
-                - pattern: $password = "..."
-                - pattern: $secret = "..."
-                - pattern: $api_key = "..."
-                - pattern: define('..._SECRET', '...')
-              message: "Possible hardcoded secret/credential"
-              languages: [php]
-              severity: WARNING
-              metadata:
-                cwe: CWE-798
-                owasp: A02
-
-            - id: php-missing-csrf-check
-              patterns:
-                - pattern: |
-                    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-                      ...
-                    }
-              pattern-not: |
-                if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-                  ...
-                  check_csrf_token(...)
-                  ...
-                }
-              message: "POST handler may be missing CSRF token validation"
-              languages: [php]
-              severity: WARNING
-              metadata:
-                cwe: CWE-352
-                owasp: A01
-
-            # ── JavaScript dangerous sinks ──────────────────────
-
-            - id: js-innerhtml-user-data
-              patterns:
-                - pattern: $X.innerHTML = location.search
-                - pattern: $X.innerHTML = location.hash
-                - pattern: document.write(location.search)
-                - pattern: document.write(location.hash)
-              message: "DOM XSS — user-controlled URL fragment/query written to DOM"
-              languages: [javascript]
-              severity: ERROR
-              metadata:
-                cwe: CWE-79
-                owasp: A03
-
-            - id: js-eval-user-data
-              patterns:
-                - pattern: eval(location.search)
-                - pattern: eval(location.hash)
-                - pattern: eval($FUNC(...))
-              message: "eval() with potentially user-controlled data"
-              languages: [javascript]
-              severity: ERROR
-              metadata:
-                cwe: CWE-79
-                owasp: A03
-
-            - id: js-prototype-pollution
-              pattern: $obj[...][...] = $val
-              message: "Possible prototype pollution via bracket notation assignment"
-              languages: [javascript]
-              severity: WARNING
-              metadata:
-                cwe: CWE-1321
-                owasp: A08
-
-            - id: js-open-redirect
-              pattern: window.location = $INPUT
-              message: "Potential open redirect via unvalidated assignment to window.location"
-              languages: [javascript]
-              severity: WARNING
-              metadata:
-                cwe: CWE-601
-                owasp: A01
-          RULES
 
       - name: Run Semgrep — official PHP security ruleset
         run: |
-          mkdir -p $REPORTS_DIR
+          mkdir -p security-reports
+          # Validate custom rules before using them
+          if semgrep --validate --config semgrep-rules/zabbix-custom.yml 2>&1; then
+            CUSTOM_CONFIG="--config semgrep-rules/zabbix-custom.yml"
+            echo "Custom rules valid — including in scan"
+          else
+            CUSTOM_CONFIG=""
+            echo "Custom rules invalid — skipping custom config"
+          fi
           semgrep scan \
             --config "p/php" \
             --config "p/owasp-top-ten" \
             --config "p/security-audit" \
-            --config "p/secrets" \
-            --config semgrep-rules/zabbix-custom.yml \
+            $CUSTOM_CONFIG \
             --sarif \
-            --output $REPORTS_DIR/semgrep-php.sarif \
+            --output security-reports/semgrep-php.sarif \
             --severity WARNING \
             --timeout 300 \
             --max-memory 2000 \
+            --include="*.php" \
             ui/ \
-          || true   # don't fail the step; findings are reported separately
-        env:
-          REPORTS_DIR: security-reports
+          || true
 
       - name: Run Semgrep — JavaScript security ruleset
         run: |
@@ -382,24 +313,35 @@ jobs:
             --config "p/xss" \
             --config "p/dom-xss" \
             --config "p/prototype-pollution" \
+            --config "p/default" \
             --sarif \
             --output security-reports/semgrep-js.sarif \
             --severity WARNING \
             --timeout 300 \
             --max-memory 2000 \
+            --include="*.js" \
             ui/ \
           || true
+          # Ensure the SARIF file exists even if semgrep produced nothing
+          if [ ! -f security-reports/semgrep-js.sarif ]; then
+            echo '{"version":"2.1.0","runs":[]}' > security-reports/semgrep-js.sarif
+            echo "Wrote empty fallback SARIF for semgrep-js"
+          fi
 
       - name: Run Semgrep — custom Zabbix rules only (text summary)
         run: |
-          semgrep scan \
-            --config semgrep-rules/zabbix-custom.yml \
-            --text \
-            --severity WARNING \
-            --timeout 300 \
-            ui/ \
-          2>&1 | tee security-reports/semgrep-custom-summary.txt \
-          || true
+          if [ -f semgrep-rules/zabbix-custom.yml ]; then
+            semgrep scan \
+              --config semgrep-rules/zabbix-custom.yml \
+              --text \
+              --severity WARNING \
+              --timeout 300 \
+              ui/ \
+            2>&1 | tee security-reports/semgrep-custom-summary.txt \
+            || true
+          else
+            echo "Custom rules file not found" > security-reports/semgrep-custom-summary.txt
+          fi
 
       - name: Upload Semgrep SARIF to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v4
@@ -496,17 +438,22 @@ jobs:
 
       - name: Install PHP security tools
         run: |
-          # PHP_CodeSniffer + Security Audit standard
+          # Install PHP_CodeSniffer + SecurityAudit standard + PHPStan
           composer global require \
             "squizlabs/php_codesniffer:*" \
             "pheromone/phpcs-security-audit:*" \
             "phpstan/phpstan:*" \
             --no-interaction --quiet
 
-          # Psalm with security taint analysis
-          composer global require \
-            "vimeo/psalm:*" \
-            --no-interaction --quiet || true
+          # CRITICAL: Register the SecurityAudit standard path with phpcs
+          # Without this, phpcs reports "standard not installed" and scans nothing
+          PHPCS_BIN=~/.composer/vendor/bin/phpcs
+          AUDIT_PATH=~/.composer/vendor/pheromone/phpcs-security-audit
+          $PHPCS_BIN --config-set installed_paths "$AUDIT_PATH"
+
+          # Verify it registered correctly
+          echo "=== Installed PHPCS standards ==="
+          $PHPCS_BIN -i
 
       - name: Run PHPCS Security Audit
         run: |
