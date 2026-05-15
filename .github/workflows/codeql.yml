@@ -66,16 +66,18 @@ jobs:
           retention-days: 1
 
   # ─────────────────────────────────────────────────────────
-  # JOB 2 — CodeQL (PHP + JavaScript)
+  # JOB 2 — CodeQL (JavaScript only — PHP not supported by CodeQL)
   # ─────────────────────────────────────────────────────────
   codeql:
-    name: CodeQL (${{ matrix.language }})
+    name: CodeQL (${{ matrix.language }}) — JS only
     needs: prepare
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        language: [php, javascript]
+        language: [javascript]
+        # NOTE: CodeQL does not support PHP (see github.com/github/codeql — PHP is not listed).
+        # PHP is covered by Semgrep + PHPCS jobs below.
 
     steps:
       - name: Checkout
@@ -775,9 +777,9 @@ jobs:
               <tbody>
                 <tr>
                   <td><strong>CodeQL</strong></td>
-                  <td>PHP, JavaScript</td>
+                  <td>JavaScript only (PHP not supported by CodeQL)</td>
                   <td>A01–A03, A07–A10</td>
-                  <td>${{ steps.counts.outputs.codeql_php }} / ${{ steps.counts.outputs.codeql_js }}</td>
+                  <td>${{ steps.counts.outputs.codeql_js }}</td>
                   <td>GitHub Security tab → Code scanning</td>
                 </tr>
                 <tr>
@@ -823,7 +825,7 @@ jobs:
             <div class="owasp-grid">
               <div class="owasp-card"><div class="id">A01</div><div class="name">Broken Access Control</div><div class="tools">CodeQL · Semgrep custom rules</div></div>
               <div class="owasp-card"><div class="id">A02</div><div class="name">Cryptographic Failures</div><div class="tools">Semgrep (weak random, MD5, hardcoded) · Gitleaks</div></div>
-              <div class="owasp-card"><div class="id">A03</div><div class="name">Injection (SQLi, CMDi, XSS…)</div><div class="tools">CodeQL · Semgrep · PHPCS-Security</div></div>
+              <div class="owasp-card"><div class="id">A03</div><div class="name">Injection (SQLi, CMDi, XSS…)</div><div class="tools">CodeQL (JS) · Semgrep (PHP+JS) · PHPCS-Security (PHP)</div></div>
               <div class="owasp-card"><div class="id">A04</div><div class="name">Insecure Design</div><div class="tools">PHPStan · Semgrep</div></div>
               <div class="owasp-card"><div class="id">A05</div><div class="name">Security Misconfiguration</div><div class="tools">Semgrep · PHPCS-Security</div></div>
               <div class="owasp-card"><div class="id">A06</div><div class="name">Vulnerable Components</div><div class="tools">OSV-Scanner · npm audit</div></div>
